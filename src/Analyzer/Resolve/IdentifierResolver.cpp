@@ -13,7 +13,6 @@
 #include <Storages/MaterializedView/RefreshSet.h>
 #include <Storages/MaterializedView/RefreshTask.h>
 
-#include <Access/Common/AccessType.h>
 #include <Databases/DatabaseOverlay.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/JoinUtils.h>

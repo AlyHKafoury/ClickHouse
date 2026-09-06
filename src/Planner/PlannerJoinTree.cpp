@@ -87,7 +87,6 @@
 #include <Processors/QueryPlan/ParallelReplicasLocalPlan.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 
-#include <Access/EnabledRowPolicies.h>
 #include <Databases/DatabaseOverlay.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/ArrayJoinAction.h>
