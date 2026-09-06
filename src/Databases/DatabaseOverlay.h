@@ -68,6 +68,16 @@ public:
     UUID getUUID() const override;
     UUID tryGetTableUUID(const String & table_name) const override;
 
+    /// The database that receives a table created through this `Overlay`: its first writable source
+    /// (the same one `createTable` delegates to), or `nullptr` when there is none.
+    DatabasePtr tryGetTableCreationDatabase() const;
+
+    /// The database that a table created in `database` really belongs to: the delegate above when
+    /// `database` is a read-only `Overlay` facade with a writable source, `database` itself
+    /// otherwise. The facade has no UUID of its own (see `getUUID`) and owns no metadata, so
+    /// `InterpreterCreateQuery` creates the table in the delegate under the delegate's name.
+    static DatabasePtr resolveTableCreationDatabase(const DatabasePtr & database);
+
     void drop(ContextPtr context) override;
 
     void alterTable(ContextPtr local_context, const StorageID & table_id, const StorageInMemoryMetadata & metadata, bool validate_new_create_query) override;

@@ -4,6 +4,7 @@
 #include <filesystem>
 
 #include <Access/AccessControl.h>
+#include <Access/ContextAccess.h>
 #include <Access/User.h>
 
 #include <Core/Settings.h>
@@ -193,6 +194,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_DATABASE;
     extern const int PATH_ACCESS_DENIED;
     extern const int ACCESS_DENIED;
+    extern const int TABLE_IS_PERMANENTLY_READ_ONLY;
     extern const int NOT_IMPLEMENTED;
     extern const int ENGINE_REQUIRED;
     extern const int UNKNOWN_STORAGE;
@@ -2386,7 +2388,21 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
 
     database = DatabaseCatalog::instance().getDatabase(create.getDatabase());
 
-    assertOrSetUUID(create, database);
+    /// A read-only `Overlay` facade owns no storage of its own, so `ATTACH TABLE` through it is
+    /// rejected up front, in every syntax and regardless of `IF NOT EXISTS`: the generic existence
+    /// check below would otherwise answer for a name that already resolves through the facade, and
+    /// the full syntax would otherwise be delegated to a source like `CREATE TABLE` (see below).
+    if (create.attach)
+        if (const auto * overlay = typeid_cast<const DatabaseOverlay *>(database.get()); overlay && overlay->isReadOnly())
+            throw Exception(
+                ErrorCodes::TABLE_IS_PERMANENTLY_READ_ONLY,
+                "Database {} is an Overlay facade (read-only). Run ATTACH TABLE in an underlying database",
+                backQuoteIfNeed(create.getDatabase()));
+
+    /// `CREATE TABLE` through a read-only `Overlay` facade is delegated to its first writable source
+    /// database, and the facade itself has no UUID, so that source decides whether the table needs
+    /// a UUID (`Atomic`) or not.
+    assertOrSetUUID(create, DatabaseOverlay::resolveTableCreationDatabase(database));
 
     String storage_name = create.is_dictionary ? "Dictionary" : "Table";
     auto storage_already_exists_error_code = create.is_dictionary ? ErrorCodes::DICTIONARY_ALREADY_EXISTS : ErrorCodes::TABLE_ALREADY_EXISTS;
@@ -2446,6 +2462,35 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
         /// We are not checking this for secondary creates to avoid backward compatibility issues.
         if (mode <= LoadingStrictnessLevel::CREATE)
             database->checkTableNameLength(create.getTable());
+    }
+
+    /// A table created through a read-only `Overlay` facade is created in the facade's first
+    /// writable source database, from here on exactly as if the query had named that database: the
+    /// source owns the table, its metadata file and its data path, and the table's `StorageID` must
+    /// carry the source name (an `Atomic` database refuses a query that names another database).
+    /// The name was checked above against the facade as a whole, so a name that already resolves
+    /// through any source is still rejected (`ATTACH` was rejected up front).
+    ///
+    /// The facade's dual-grant contract applies: the grants for the query as written (on the facade)
+    /// were checked already, and the same grants are required on the source database that receives
+    /// the table. The source is probed rather than named, so the denial is keyed to the facade name.
+    if (auto delegate = DatabaseOverlay::resolveTableCreationDatabase(database); delegate != database)
+    {
+        const String facade_name = create.getDatabase();
+        create.setDatabase(delegate->getDatabaseName());
+        if (!getContext()->getAccess()->isGranted(getRequiredAccess()))
+        {
+            create.setDatabase(facade_name);
+            throw Exception(
+                ErrorCodes::ACCESS_DENIED,
+                "{}: Not enough privileges. To execute this query, it's necessary to have the grant {} ON {}.{} in the "
+                "underlying source database of this Overlay facade",
+                getContext()->getUserName(),
+                toString(create.is_dictionary ? AccessType::CREATE_DICTIONARY : (create.isView() ? AccessType::CREATE_VIEW : AccessType::CREATE_TABLE)),
+                backQuote(facade_name),
+                backQuote(create.getTable()));
+        }
+        database = delegate;
     }
 
     data_path = database->getTableDataPath(create);

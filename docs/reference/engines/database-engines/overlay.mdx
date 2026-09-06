@@ -38,7 +38,7 @@ Sources are searched in the order they were listed in `CREATE DATABASE ... ENGIN
 
 | Operation                  | Behavior                                                                                        |
 | :------------------------- | :-----------------------------------------------------------------------------------------------|
-| `CREATE TABLE dboverlay.*` | **Pass-through** — creates the table in the first underlying database.                              |
+| `CREATE TABLE dboverlay.*` | **Pass-through** — creates the table in the first underlying database, under that database's name; requires `CREATE TABLE` on both the `Overlay` and that database.                              |
 | `ATTACH TABLE dboverlay.*` | **Rejected** — `TABLE_IS_PERMANENTLY_READ_ONLY`. Attach the table in an underlying database.     |
 | `ALTER TABLE dboverlay.*`  | **Rejected** — `TABLE_IS_PERMANENTLY_READ_ONLY`.                                                |
 | `RENAME TABLE dboverlay.*` | **Rejected** — `TABLE_IS_PERMANENTLY_READ_ONLY`.                                                |
@@ -124,6 +124,7 @@ Accessing a table through an `Overlay` database requires a grant on **both** the
 - `INSERT` through the facade likewise requires the `INSERT` privilege on both the `Overlay` and the underlying source database;
 - the same dual-grant `SELECT` check covers the other read entrypoints that resolve the facade name to a source table, such as `WATCH`;
 - management operations that resolve the facade name to a source table follow the same rule: `CHECK TABLE` requires the `CHECK` privilege on both the `Overlay` and the underlying source table, and `KILL MUTATION` / `KILL PART_MOVE TO SHARD` targeting a facade row of `system.mutations` / `system.part_moves_between_shards` require the corresponding `ALTER` privilege on both;
+- `CREATE TABLE` through the facade creates the table in the first source database and requires the `CREATE TABLE` privilege on both the `Overlay` and that source database; the denial names only the facade;
 - create-time paths that read or write through the facade follow the same rule: `CREATE TABLE ... AS` (including `CLONE AS`) a facade name copies the schema of the underlying source table and requires `SHOW COLUMNS` on both the `Overlay` and the source table, and `CREATE MATERIALIZED VIEW ... TO` a facade target funnels writes into the source table and requires the `SELECT` and `INSERT` privileges on both;
 - a parameterized view called through the facade (`SELECT ... FROM overlay_db.v(param = ...)`) runs the underlying source view and requires `SELECT` on both the `Overlay` and the source view, and `DESCRIBE` of such a call requires `SHOW COLUMNS` on both.
 

@@ -315,15 +315,31 @@ StoragePtr DatabaseOverlay::tryGetTable(const String & table_name, ContextPtr co
     return result;
 }
 
+DatabasePtr DatabaseOverlay::tryGetTableCreationDatabase() const
+{
+    for (const auto & db : resolveDatabases())
+        if (!db->isReadOnly())
+            return db;
+    return nullptr;
+}
+
+DatabasePtr DatabaseOverlay::resolveTableCreationDatabase(const DatabasePtr & database)
+{
+    /// Only a read-only facade redirects: in the non-readonly mode (`clickhouse-local`) the members
+    /// are not registered in the catalog on their own, the overlay stands for them (see `getUUID`),
+    /// and `createTable` forwards to the first writable member itself.
+    if (const auto * overlay = typeid_cast<const DatabaseOverlay *>(database.get()); overlay && overlay->readonly)
+        if (auto target = overlay->tryGetTableCreationDatabase())
+            return target;
+    return database;
+}
+
 void DatabaseOverlay::createTable(ContextPtr context_, const String & table_name, const StoragePtr & table, const ASTPtr & query)
 {
-    for (auto & db : resolveDatabases())
+    if (auto db = tryGetTableCreationDatabase())
     {
-        if (!db->isReadOnly())
-        {
-            db->createTable(context_, table_name, table, query);
-            return;
-        }
+        db->createTable(context_, table_name, table, query);
+        return;
     }
     throw Exception(
         ErrorCodes::LOGICAL_ERROR,
@@ -525,28 +541,45 @@ bool DatabaseOverlay::isReadOnly() const
 
 UUID DatabaseOverlay::getUUID() const
 {
-    // The table creation path delegates to the first available source database. Returning its
-    // UUID ensures that an Atomic source generates table UUIDs before it receives the table.
-    UUID result = UUIDHelpers::Nil;
-    for (const auto & db : resolveDatabases())
+    /// A read-only facade has no UUID of its own. Its sources are registered in `DatabaseCatalog`
+    /// independently, so answering with a source's UUID would register the facade under the same
+    /// UUID (`DatabaseCatalog::attachDatabase` maps every non-Nil answer). Moreover, the catalog
+    /// calls this while holding its `databases_mutex` (`attachDatabase`, `detachDatabase`,
+    /// `shutdown`), so resolving the sources through the catalog here re-enters that lock and
+    /// wedges the server on the first `CREATE DATABASE ... ENGINE = Overlay`. The UUID contract of
+    /// a table created through the facade is that of the delegate source database, which
+    /// `InterpreterCreateQuery` obtains with `resolveTableCreationDatabase`.
+    if (readonly)
+        return UUIDHelpers::Nil;
+
+    /// In the non-readonly mode (`clickhouse-local`) the underlying databases are not registered in
+    /// the catalog independently, so for all practical purposes the overlay acts as the underlying
+    /// database.
+    for (const auto & db : databases)
     {
-        result = db->getUUID();
+        UUID result = db->getUUID();
         if (result != UUIDHelpers::Nil)
-            break;
+            return result;
     }
-    return result;
+    return UUIDHelpers::Nil;
 }
 
 UUID DatabaseOverlay::tryGetTableUUID(const String & table_name) const
 {
-    UUID result = UUIDHelpers::Nil;
-    for (const auto & db : resolveDatabases())
+    /// A read-only facade must not answer with the UUID of a source table: `Context::resolveStorageID`
+    /// would stamp it onto the facade-qualified id, and `DatabaseCatalog::getTable` then resolves by
+    /// UUID straight to the source, either failing with `TABLE_UUID_MISMATCH` (the databases differ)
+    /// or losing the facade identity that the access checks and row policies are keyed on.
+    if (readonly)
+        return UUIDHelpers::Nil;
+
+    for (const auto & db : databases)
     {
-        result = db->tryGetTableUUID(table_name);
+        UUID result = db->tryGetTableUUID(table_name);
         if (result != UUIDHelpers::Nil)
-            break;
+            return result;
     }
-    return result;
+    return UUIDHelpers::Nil;
 }
 
 void DatabaseOverlay::drop(ContextPtr context_)
@@ -1051,18 +1084,18 @@ void DatabaseOverlay::stopLoading()
 
 void DatabaseOverlay::checkMetadataFilenameAvailability(const String & table_name) const
 {
-    if (readonly)
-        throw Exception(
-            ErrorCodes::TABLE_IS_PERMANENTLY_READ_ONLY,
-            "Database {} is an Overlay facade (read-only). Path resolution is not supported here.",
-            backQuote(getDatabaseName()));
-    for (const auto & db : databases)
+    /// The metadata file belongs to the member `createTable` writes to.
+    if (auto db = tryGetTableCreationDatabase())
     {
-        if (db->isReadOnly())
-            continue;
         db->checkMetadataFilenameAvailability(table_name);
         return;
     }
+    if (readonly)
+        throw Exception(
+            ErrorCodes::TABLE_IS_PERMANENTLY_READ_ONLY,
+            "Database {} is an Overlay facade (read-only) without a writable source database. "
+            "Run CREATE TABLE in an underlying database",
+            backQuote(getDatabaseName()));
 }
 
 void registerDatabaseOverlay(DatabaseFactory & factory);
@@ -1215,7 +1248,7 @@ Sources are searched in the order they were listed in `CREATE DATABASE ... ENGIN
 
 | Operation                  | Behavior                                                                                        |
 | :------------------------- | :-----------------------------------------------------------------------------------------------|
-| `CREATE TABLE dboverlay.*` | **Pass-through** — creates the table in the first underlying database.                              |
+| `CREATE TABLE dboverlay.*` | **Pass-through** — creates the table in the first underlying database, under that database's name; requires `CREATE TABLE` on both the `Overlay` and that database.                              |
 | `ATTACH TABLE dboverlay.*` | **Rejected** — `TABLE_IS_PERMANENTLY_READ_ONLY`. Attach the table in an underlying database.     |
 | `ALTER TABLE dboverlay.*`  | **Rejected** — `TABLE_IS_PERMANENTLY_READ_ONLY`.                                                |
 | `RENAME TABLE dboverlay.*` | **Rejected** — `TABLE_IS_PERMANENTLY_READ_ONLY`.                                                |
@@ -1301,6 +1334,7 @@ Accessing a table through an `Overlay` database requires a grant on **both** the
 - `INSERT` through the facade likewise requires the `INSERT` privilege on both the `Overlay` and the underlying source database;
 - the same dual-grant `SELECT` check covers the other read entrypoints that resolve the facade name to a source table, such as `WATCH`;
 - management operations that resolve the facade name to a source table follow the same rule: `CHECK TABLE` requires the `CHECK` privilege on both the `Overlay` and the underlying source table, and `KILL MUTATION` / `KILL PART_MOVE TO SHARD` targeting a facade row of `system.mutations` / `system.part_moves_between_shards` require the corresponding `ALTER` privilege on both;
+- `CREATE TABLE` through the facade creates the table in the first source database and requires the `CREATE TABLE` privilege on both the `Overlay` and that source database; the denial names only the facade;
 - create-time paths that read or write through the facade follow the same rule: `CREATE TABLE ... AS` (including `CLONE AS`) a facade name copies the schema of the underlying source table and requires `SHOW COLUMNS` on both the `Overlay` and the source table, and `CREATE MATERIALIZED VIEW ... TO` a facade target funnels writes into the source table and requires the `SELECT` and `INSERT` privileges on both;
 - a parameterized view called through the facade (`SELECT ... FROM overlay_db.v(param = ...)`) runs the underlying source view and requires `SELECT` on both the `Overlay` and the source view, and `DESCRIBE` of such a call requires `SHOW COLUMNS` on both.
 
@@ -1339,14 +1373,9 @@ GRANT SELECT ON db_a.* TO some_user;
 
 void DatabaseOverlay::checkTableNameLength(const String & table_name) const
 {
-    /// The limit belongs to the member createTable writes to, which owns the metadata file.
-    for (const auto & db : resolveDatabases())
-    {
-        if (db->isReadOnly())
-            continue;
+    /// The limit belongs to the member `createTable` writes to, which owns the metadata file.
+    if (auto db = tryGetTableCreationDatabase())
         db->checkTableNameLength(table_name);
-        return;
-    }
 }
 
 }
