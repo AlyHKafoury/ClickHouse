@@ -2400,9 +2400,34 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
                 backQuoteIfNeed(create.getDatabase()));
 
     /// `CREATE TABLE` through a read-only `Overlay` facade is delegated to its first writable source
-    /// database, and the facade itself has no UUID, so that source decides whether the table needs
-    /// a UUID (`Atomic`) or not.
-    assertOrSetUUID(create, DatabaseOverlay::resolveTableCreationDatabase(database));
+    /// database (see below), and the facade's dual-grant contract applies: the grants for the query
+    /// as written (on the facade) were checked already, and the same grants are required on the
+    /// source database that receives the table. The source-side grant is proved here, before any
+    /// probe of the facade or its sources: the facade-wide existence check below walks the sources,
+    /// so its answer (`TABLE_ALREADY_EXISTS`, a silent `IF NOT EXISTS`, or a broken source's own
+    /// error) would otherwise tell a caller without the source-side grant which names the hidden
+    /// sources hold. The source is probed rather than named, so the denial is keyed to the facade name.
+    const DatabasePtr table_creation_database = DatabaseOverlay::resolveTableCreationDatabase(database);
+    if (table_creation_database != database)
+    {
+        const String facade_name = create.getDatabase();
+        create.setDatabase(table_creation_database->getDatabaseName());
+        const bool granted_on_source = getContext()->getAccess()->isGranted(getRequiredAccess());
+        create.setDatabase(facade_name);
+        if (!granted_on_source)
+            throw Exception(
+                ErrorCodes::ACCESS_DENIED,
+                "{}: Not enough privileges. To execute this query, it's necessary to have the grant {} ON {}.{} in the "
+                "underlying source database of this Overlay facade",
+                getContext()->getUserName(),
+                toString(create.is_dictionary ? AccessType::CREATE_DICTIONARY : (create.isView() ? AccessType::CREATE_VIEW : AccessType::CREATE_TABLE)),
+                backQuote(facade_name),
+                backQuote(create.getTable()));
+    }
+
+    /// The facade itself has no UUID, so the source that receives the table decides whether it
+    /// needs a UUID (`Atomic`) or not.
+    assertOrSetUUID(create, table_creation_database);
 
     String storage_name = create.is_dictionary ? "Dictionary" : "Table";
     auto storage_already_exists_error_code = create.is_dictionary ? ErrorCodes::DICTIONARY_ALREADY_EXISTS : ErrorCodes::TABLE_ALREADY_EXISTS;
@@ -2469,28 +2494,12 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
     /// source owns the table, its metadata file and its data path, and the table's `StorageID` must
     /// carry the source name (an `Atomic` database refuses a query that names another database).
     /// The name was checked above against the facade as a whole, so a name that already resolves
-    /// through any source is still rejected (`ATTACH` was rejected up front).
-    ///
-    /// The facade's dual-grant contract applies: the grants for the query as written (on the facade)
-    /// were checked already, and the same grants are required on the source database that receives
-    /// the table. The source is probed rather than named, so the denial is keyed to the facade name.
-    if (auto delegate = DatabaseOverlay::resolveTableCreationDatabase(database); delegate != database)
+    /// through any source is still rejected (`ATTACH` was rejected up front), and the source-side
+    /// grant was proved before that check.
+    if (table_creation_database != database)
     {
-        const String facade_name = create.getDatabase();
-        create.setDatabase(delegate->getDatabaseName());
-        if (!getContext()->getAccess()->isGranted(getRequiredAccess()))
-        {
-            create.setDatabase(facade_name);
-            throw Exception(
-                ErrorCodes::ACCESS_DENIED,
-                "{}: Not enough privileges. To execute this query, it's necessary to have the grant {} ON {}.{} in the "
-                "underlying source database of this Overlay facade",
-                getContext()->getUserName(),
-                toString(create.is_dictionary ? AccessType::CREATE_DICTIONARY : (create.isView() ? AccessType::CREATE_VIEW : AccessType::CREATE_TABLE)),
-                backQuote(facade_name),
-                backQuote(create.getTable()));
-        }
-        database = delegate;
+        create.setDatabase(table_creation_database->getDatabaseName());
+        database = table_creation_database;
     }
 
     data_path = database->getTableDataPath(create);
