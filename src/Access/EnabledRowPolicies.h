@@ -28,10 +28,7 @@ struct RowPolicyFilter
 
 using RowPolicyFilterPtr = std::shared_ptr<const RowPolicyFilter>;
 
-/// Combines two row-policy filters into one whose expression is the logical AND of both
-/// (a row passes only if it passes both), merging their policy lists. Always-true filters are
-/// treated as identity, and a null filter yields the other. Used to enforce the row policies of
-/// both an `Overlay` facade and its underlying source table when reading through the facade.
+/// Combines two prepared row policy filters with a logical AND and retains their contributing policies.
 RowPolicyFilterPtr combineRowPolicyFilters(RowPolicyFilterPtr filter, RowPolicyFilterPtr combine_with_filter);
 
 
